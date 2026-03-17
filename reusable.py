@@ -205,9 +205,156 @@ def create_origins(grid, grid_pop=None):
 
     return origins
 
-def create_POIs(osm):
+def create_POIs(osm, summary=False):
     destinations = osm.get_pois(custom_filter={'amenity': True})    # filter by check in column
-     
+
+    noise_categories = [
+    'parking', 'bicycle_parking', 'bench', 'waste_basket', 'recycling', 'waste_disposal',
+    'vending_machine', 'parking_entrance', 'post_box', 'hunting_stand', 'parking_space',
+    'car_sharing', 'tourist_bus_parking', 'waste_transfer_station'
+    ]
+
+    destinations = destinations[~destinations['amenity'].isin(noise_categories)] # filter OUT
+
+    # drop rows with missing or invalid geometry
+    destinations = destinations[destinations.geometry.notna()]
+    destinations = destinations[~destinations.geometry.is_empty]
+
+    domain_mapping = {
+    # Food & Drink
+    'restaurant': 'food_and_drink', 'cafe': 'food_and_drink', 'bbq': 'food_and_drink',
+    'fast_food': 'food_and_drink', 'bar': 'food_and_drink', 'pub': 'food_and_drink',
+    'food_court': 'food_and_drink',
+    
+    # Healthcare
+    'hospital': 'healthcare', 'clinic': 'healthcare', 'social_facility': 'healthcare',
+    'pharmacy': 'healthcare', 'doctors': 'healthcare', 'dentist': 'healthcare',
+    
+    # Education
+    'school': 'education', 'kindergarten': 'education', 'library': 'education',
+    'university': 'education', 'college': 'education', 'childcare': 'education',
+    
+    # Social / community 
+    'community_centre': 'community', 'events_venue': 'community', 
+    'place_of_worship': 'community', 
+
+    # entertainment
+    'theatre': 'entertainment', 'cinema': 'entertainment', "arts_centre": 'entertainment',
+
+    
+    # Essential Services
+    'bank': 'essential_services', 'post_office': 'essential_services', 'telephone': 'essential_services',
+    'police': 'essential_services', 'fire_station': 'essential_services', 'atm': 'essential_services'
+    }
+
+    # Apply the mapping to a new column. 
+    # If a tag isn't in the dictionary, it just keeps its original OSM name.
+    destinations['amenity class'] = destinations['amenity'].replace(domain_mapping)
+
+    utm_crs = destinations.estimate_utm_crs()
+    destinations_utm = destinations.to_crs(utm_crs)
+    destinations_utm["geometry"] = destinations_utm.geometry.centroid
+    destinations = destinations_utm.to_crs("EPSG:4326")
+
+    destinations = destinations.reset_index(drop=True)  # adding useful columns
+    destinations["id"] = destinations.index.astype(str)
+    destinations["opp_weight"] = 1
+
+    keep_cols = ["id", "geometry", "amenity", "amenity class", "opp_weight"]
+
+    if summary:
+        print(f"Total amenities: {len(destinations)}")
+        print("\nBy type:")
+        print(destinations["amenity class"].value_counts().head(10).to_string())
+
+    return destinations[keep_cols]
+
+
+def min_travel_time(travel_time_matrix, destinations):
+    # excluding 0 from min. calculation, i.e. in case that no amenity was reachable from given points of origin < threshold
+    travel_time_matrix["travel_time"] = travel_time_matrix["travel_time"].replace(0, float("nan"))
+
+    ttm = travel_time_matrix.merge(
+        destinations[["id", "amenity class"]],
+        left_on="to_id",
+        right_on="id",
+        how="left"
+    )
+
+    min_tt = (
+        ttm.groupby(["from_id", "amenity class"])["travel_time"]
+        .min()
+        .reset_index()
+        .rename(columns={"travel_time": "min_travel_time"})
+    )
+
+    # pivot
+    min_tt_wide = min_tt.pivot(
+        index="from_id",
+        columns="amenity class",
+        values="min_travel_time"
+    ).reset_index()
+    min_tt_wide.columns.name = None
+
+    # rename columns to min_tt_{category}
+    categories = [c for c in min_tt_wide.columns if c != "from_id"]
+    min_tt_wide = min_tt_wide.rename(columns={c: f"min_tt_{c}" for c in categories})
+
+    #average
+    tt_cols = [f"min_tt_{c}" for c in categories]
+    min_tt_wide["avg_tt"] = min_tt_wide[tt_cols].mean(axis=1)
+
+    #make sure to distinguish unreachable destinations (since this is skipped over when computing avg.)
+    min_tt_wide["n_unreachable_categories"] = min_tt_wide[tt_cols].isna().sum(axis=1)
+    return min_tt_wide
+
+
+def merge_geometry(results, grid, from_id_col="from_id"):
+    grid_indexed = grid[["geometry"]].copy().reset_index(drop=True)
+    grid_indexed["_id"] = grid_indexed.index.astype(str)
+
+    results_copy = results.copy()
+    results_copy[from_id_col] = results_copy[from_id_col].astype(str)
+
+    merged = results_copy.merge(
+        grid_indexed,
+        left_on=from_id_col,
+        right_on="_id",
+        how="left"
+    ).drop(columns="_id")
+
+    return gpd.GeoDataFrame(merged, geometry="geometry", crs=grid.crs)
+
+def plot_hex_score(results_geo, score_col, from_id_col="from_id", scheme="Quantiles",
+                   k=9, cmap="viridis", title=None, figsize=(14, 12), legend_fmt="{:.1f}"):
+
+    n_missing = results_geo[score_col].isna().sum()
+    if n_missing > 0:
+        print(f"Note: {n_missing} hexes have NaN for '{score_col}' and will appear grey.")
+
+    fig, ax = plt.subplots(1, 1, figsize=figsize)
+
+    results_geo.plot(
+        column=score_col,
+        cmap=cmap,
+        scheme=scheme,
+        k=k,
+        legend=True,
+        linewidth=0.02,
+        edgecolor="none",
+        missing_kwds={"color": "lightgrey", "label": "No data"},
+        legend_kwds={
+            "loc": "lower right",
+            "title": score_col.replace("_", " ").title(),
+            "fmt": legend_fmt
+        },
+        ax=ax
+    )
+
+    ax.set_title(title if title else score_col.replace("_", " ").title(), fontsize=18)
+    ax.set_axis_off()
+    plt.tight_layout()
+    plt.show()
 
 
 #---------------------------OTHER---------------------------------
