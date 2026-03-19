@@ -269,6 +269,38 @@ def create_POIs(osm, summary=False):
 
     return destinations[keep_cols]
 
+def suggested_beta(cutoff_minutes, target_weight=0.5):
+    """
+    Returns beta such that an amenity at cutoff_minutes retains target_weight of its value.
+    e.g. cutoff=30, target_weight=0.1 → amenity at 30min = 10% weight
+    """
+    return -np.log(target_weight) / cutoff_minutes
+
+def compute_gravity_scores(travel_time_matrix, destinations, beta=0.08):
+    tt = travel_time_matrix.pivot(index="from_id", columns="to_id", values="travel_time").reset_index()
+    tt.columns.name = None
+    value_cols = [c for c in tt.columns if c != "from_id"]
+
+    tt[value_cols] = tt[value_cols].apply(pd.to_numeric, errors="coerce")
+    decayed = np.exp(-beta * tt[value_cols]).fillna(0)
+
+    result = tt[["from_id"]].copy()
+    for amenity_class, group in destinations.groupby("amenity class"):
+        dest_ids = set(group["id"].tolist())
+        matching_cols = [c for c in decayed.columns if c in dest_ids]
+
+        col_name = f"gravity_{amenity_class.lower().replace(' ', '_')}"
+        result[col_name] = decayed[matching_cols].sum(axis=1) if matching_cols else 0
+
+    # clean up pivot index name and ensure from_id is first column
+    result = result.rename(columns={"to_id": "from_id"}).reset_index(drop=True)
+    result = result[["from_id"] + [c for c in result.columns if c.startswith("gravity_")]]
+
+    # add average gravity score across all categories
+    gravity_cols = [c for c in result.columns if c.startswith("gravity_")]
+    result["avg_gravity"] = result[gravity_cols].mean(axis=1)
+
+    return result
 
 def min_travel_time(travel_time_matrix, destinations):
     # excluding 0 from min. calculation, i.e. in case that no amenity was reachable from given points of origin < threshold
@@ -308,6 +340,31 @@ def min_travel_time(travel_time_matrix, destinations):
     min_tt_wide["n_unreachable_categories"] = min_tt_wide[tt_cols].isna().sum(axis=1)
     return min_tt_wide
 
+def weight_pop(results, origins, pop_col="population", score_cols=None, normalisation=100, return_full=False):
+    """
+    normalisation : score per X inhabitants
+    return_full : If True, returns full results df with weighted scores appended.
+    """
+    if score_cols is None:
+        score_cols = [c for c in results.columns if c.startswith("gravity_")]
+    merged = results[["from_id"] + score_cols].merge(
+        origins[["id", "population"]],
+        left_on="from_id",
+        right_on="id",
+        how="left"
+    )
+    for col in score_cols:  # compute per capita scores (score / pop) * norm_factor
+        weighted_col = f"{col}_per_{normalisation}"
+        merged[weighted_col] = (merged[col] / merged["population"]) * normalisation
+
+    weighted_cols = [f"{c}_per_{normalisation}" for c in score_cols]
+
+    merged[weighted_cols] = merged[weighted_cols].replace([np.nan, np.inf, -np.inf], 0)
+
+    if return_full:
+        return results.merge(merged[["from_id"] + weighted_cols], on="from_id", how="left")
+    else:
+        return merged[["from_id"] + weighted_cols]
 
 def merge_geometry(results, grid, from_id_col="from_id"):
     grid_indexed = grid[["geometry"]].copy().reset_index(drop=True)
