@@ -1,17 +1,20 @@
 import rasterio
 import rasterio.mask
 import r5py as r5
-import h3
 import geopandas as gpd
 from shapely.geometry import Polygon, box
+from scipy.spatial.distance import jensenshannon
+from scipy.stats import entropy
 from pyrosm import OSM
 import numpy as np
 from pyrosm.data import sources
 from pyrosm import get_data
 import matplotlib.pyplot as plt
 import pandas as pd
-import shutil
+from datetime import timedelta
+from reusable import *
 from r5py.util.config import Config
+import os, json
 
 def create_hex_grid(gdf, radius_meters):
     xmin, ymin, xmax, ymax = gdf.total_bounds
@@ -60,14 +63,26 @@ def assign_population_to_grid(pop_raster_path, grid, plot=True):
     GeoDataFrame
         A copy of `grid` with a new `population` column.
     """
-    grid_out = grid.copy().reset_index(drop=True)
+    # safely handle mixed geometry types without index conflicts
+    grid_out = grid.copy()
+    grid_out = grid_out.explode(index_parts=False)       # explode MultiPolygons → Polygons
+    grid_out["geometry"] = grid_out["geometry"].buffer(0) # fix invalid geoms
+    grid_out = grid_out[~grid_out.geometry.is_empty]      # drop empty geoms
+    grid_out = grid_out.reset_index(drop=True)            # reset AFTER all geometry ops
     grid_out["id"] = grid_out.index.astype(str)
 
     with rasterio.open(pop_raster_path) as src:
         raster_crs = src.crs
-        grid_raster_crs = grid_out.to_crs(raster_crs) # reproject grid to raster CRS for clipping
-        
-        geoms = list(grid_raster_crs.geometry.values) # clip raster to grid boundaries
+        grid_raster_crs = grid_out.to_crs(raster_crs)
+
+        # explode + clean the reprojected copy too for rasterio masking
+        grid_raster_crs = grid_raster_crs.explode(index_parts=False).reset_index(drop=True)
+        grid_raster_crs["geometry"] = grid_raster_crs["geometry"].buffer(0)
+        grid_raster_crs = grid_raster_crs[~grid_raster_crs.geometry.is_empty]
+
+        from shapely.geometry import mapping
+        geoms = [mapping(geom) for geom in grid_raster_crs.geometry]
+
         try:
             out_image, out_transform = rasterio.mask.mask(src, geoms, crop=True)
         except Exception as e:
@@ -214,7 +229,7 @@ def create_POIs(osm, summary=False):
     'car_sharing', 'tourist_bus_parking', 'waste_transfer_station'
     ]
 
-    destinations = destinations[~destinations['amenity'].isin(noise_categories)] # filter OUT
+    destinations = destinations[~destinations['amenity'].isin(noise_categories)] # filter noise
 
     # drop rows with missing or invalid geometry
     destinations = destinations[destinations.geometry.notna()]
@@ -247,8 +262,6 @@ def create_POIs(osm, summary=False):
     'police': 'essential_services', 'fire_station': 'essential_services', 'atm': 'essential_services'
     }
 
-    # Apply the mapping to a new column. 
-    # If a tag isn't in the dictionary, it just keeps its original OSM name.
     destinations['amenity class'] = destinations['amenity'].replace(domain_mapping)
 
     utm_crs = destinations.estimate_utm_crs()
@@ -313,32 +326,34 @@ def min_travel_time(travel_time_matrix, destinations):
         how="left"
     )
 
-    min_tt = (
+    # aggregate min and mean
+    stats = (
         ttm.groupby(["from_id", "amenity class"])["travel_time"]
-        .min()
+        .agg(['min', 'mean'])
         .reset_index()
-        .rename(columns={"travel_time": "min_travel_time"})
     )
 
     # pivot
-    min_tt_wide = min_tt.pivot(
+    stats_wide = stats.pivot(
         index="from_id",
         columns="amenity class",
-        values="min_travel_time"
-    ).reset_index()
-    min_tt_wide.columns.name = None
+        values=["min", "mean"]
+    )
 
-    # rename columns to min_tt_{category}
-    categories = [c for c in min_tt_wide.columns if c != "from_id"]
-    min_tt_wide = min_tt_wide.rename(columns={c: f"min_tt_{c}" for c in categories})
+    # rename columns to min/avg_tt_{category}
+    stats_wide.columns = [
+        f"{stat}_tt_{cat}" if stat == 'min' else f"avg_tt_{cat}"
+        for stat, cat in stats_wide.columns
+    ]
+    stats_wide = stats_wide.reset_index()
 
-    #average
-    tt_cols = [f"min_tt_{c}" for c in categories]
-    min_tt_wide["avg_tt"] = min_tt_wide[tt_cols].mean(axis=1)
+    # global averages
+    avg_tt_cols = [c for c in stats_wide.columns if c.startswith("avg_tt_")]
+    stats_wide["avg_tt_all"]     = stats_wide[avg_tt_cols].mean(axis=1)
 
-    #make sure to distinguish unreachable destinations (since this is skipped over when computing avg.)
-    min_tt_wide["n_unreachable_categories"] = min_tt_wide[tt_cols].isna().sum(axis=1)
-    return min_tt_wide
+    # make sure to distinguish unreachable destinations (since this is skipped over when computing avg.)
+    stats_wide["n_unreachable_categories"] = stats_wide[avg_tt_cols].isna().sum(axis=1)
+    return stats_wide
 
 def weight_pop(results, origins, pop_col="population", score_cols=None, normalisation=100, return_full=False):
     """
@@ -365,6 +380,50 @@ def weight_pop(results, origins, pop_col="population", score_cols=None, normalis
         return results.merge(merged[["from_id"] + weighted_cols], on="from_id", how="left")
     else:
         return merged[["from_id"] + weighted_cols]
+
+def compute_diversity_scores(results, count_cols, id_col="from_id"):
+    """
+    Computes amenity diversity scores per hex relative to city-wide distribution.
+
+        - shannon          : standard Shannon diversity (uniform baseline)
+        - pielou_j         : Shannon normalised by log(k)
+        - jsd_from_city    : Jensen-Shannon divergence from city-wide distribution
+        - cross_entropy    : KL divergence from city-wide distribution
+    """
+    df = results[[id_col] + count_cols].copy()
+
+    city_totals = df[count_cols].sum()
+    q = (city_totals / city_totals.sum()).values  # city-wide proportions
+    print("City-wide baseline distribution:")
+    for col, val in zip(count_cols, q):
+        print(f"  {col}: {val:.3f}")
+
+    # --- per-hex proportions ---
+    row_totals = df[count_cols].sum(axis=1)
+    # avoid division by zero for hexes with no amenities
+    proportions = df[count_cols].div(row_totals.replace(0, np.nan), axis=0).fillna(0)
+
+    k = len(count_cols)
+    epsilon = 1e-10  # small value to avoid log(0)
+
+    scores = df[[id_col]].copy()
+    # standard Shannon
+    p = proportions.values + epsilon
+    scores["shannon"] = -(p * np.log(p)).sum(axis=1)
+    # KL divergence from city-wide distribution (cross-entropy)
+    scores["kl_divergence"] = proportions.apply(
+        lambda row: entropy(row.values + epsilon, q + epsilon),
+        axis=1
+    )
+    # JSD from city-wide distribution
+    scores["jsd"] = proportions.apply(
+        lambda row: jensenshannon(row.values + epsilon, q + epsilon),
+        axis=1
+    )
+    # similarity to city (1 - JSD, so higher = more like city baseline)
+    scores["city_similarity"] = 1 - scores["jsd"]
+
+    return scores
 
 def merge_geometry(results, grid, from_id_col="from_id"):
     grid_indexed = grid[["geometry"]].copy().reset_index(drop=True)
@@ -422,3 +481,90 @@ def clear_cache():
     shutil.rmtree(cache_dir)
 
     print("Cache cleared.")
+
+def build_city_geojson(
+    grid,
+    grid_pop,
+    osm,
+    tn,
+    output_path=None,
+    transport_modes=None,
+    max_time=30,
+    beta=0.08,
+    gravity_normalisation=100,
+):
+    """
+    Runs the complete accessibility metrics pipeline on given grid + osm + travel network
+
+    output_path : saves the output as GeoJSON
+    transport_modes : list of r5py transport modes (defaults to [TransportMode.TRANSIT, TransportMode.WALK])
+    max_time : travel time in minutes
+    beta : decay parameter for gravity calculation
+    gravity_normalisation : population normalisation factor for weighted scores
+
+    Returns: GeoDataFrame: Fully scored hex grid with all accessibility metrics attached.
+    """
+
+    if transport_modes is None:
+        transport_modes = [r5.TransportMode.TRANSIT, r5.TransportMode.WALK]
+
+    # --- Origins and destinations from grid and OSM ---
+    categories = ['food_and_drink','shelter','essential_services','education','healthcare','community']
+    origins = create_origins(grid, grid_pop=grid_pop)
+    destinations = create_POIs(osm)
+    destinations = destinations[destinations["amenity class"].isin(categories)].copy()
+
+    # --- Travel time matrix via r5py ---
+    ttm = r5.TravelTimeMatrix(
+        tn,
+        origins=origins,
+        destinations=destinations,
+        transport_modes=transport_modes,
+        max_time=timedelta(minutes=max_time),
+    )
+
+    # --- Gravity scores (exponential decay per amenity category) ---
+    gravity = compute_gravity_scores(ttm.copy(), destinations, beta=beta)
+
+    # --- Min + average travel time per amenity category ---
+    tt_stats = min_travel_time(ttm.copy(), destinations)
+
+    # --- Basic counts: gravity with beta=0 equals a simple reachable amenity count ---
+    counts_raw = compute_gravity_scores(ttm.copy(), destinations, beta=0)
+    counts_wide = counts_raw.rename(columns={
+        c: c.replace("gravity_", "count_") for c in counts_raw.columns if c.startswith("gravity_")
+    })
+    counts_wide = counts_wide.drop(columns=["avg_gravity"], errors="ignore")
+
+    # --- Population-weighted gravity (score per N inhabitants) ---
+    gravity_cols = [c for c in gravity.columns if c.startswith("gravity_")]
+    pop_weighted = weight_pop(
+        gravity,
+        origins,
+        score_cols=gravity_cols,
+        normalisation=gravity_normalisation,
+        return_full=False,
+    )
+
+    # --- Diversity scores (Shannon, JSD, KL divergence, city similarity) ---
+    count_cols = [c for c in counts_wide.columns if c.startswith("count_")]
+    diversity = compute_diversity_scores(counts_wide, count_cols=count_cols, id_col="from_id")
+
+    # --- Merge all score dataframes on from_id ---
+    result = origins[["id", "population"]].rename(columns={"id": "from_id"}).copy()
+    for df in [gravity, tt_stats, counts_wide, pop_weighted, diversity]:
+        df["from_id"] = df["from_id"].astype(str)
+        result = result.merge(df, on="from_id", how="left")
+
+    # --- Attach hex geometry back to results ---
+    result_geo = merge_geometry(result, grid)
+
+    # Ensure GeoJSON-friendly CRS84 / EPSG:4326 for web mapping
+    if result_geo.crs is None:
+        result_geo = result_geo.set_crs("EPSG:4326")
+    else:
+        result_geo = result_geo.to_crs("EPSG:4326")
+    if output_path:
+        result_geo.to_file(output_path, driver="GeoJSON")
+
+    return result_geo
