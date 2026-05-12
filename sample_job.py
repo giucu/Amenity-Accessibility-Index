@@ -12,7 +12,7 @@ from pyrosm import get_data
 import matplotlib.pyplot as plt
 import pandas as pd
 from datetime import timedelta
-from reusable import *
+from source.reusable import *
 
 maxTime = 60
 beta = 0.026823965207235005
