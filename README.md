@@ -12,7 +12,7 @@ This repository contains the source code for a cross-city urban accessibility an
 │   └── ...
 ├── notebooks/
 │   └── examples.ipynb
-├── data/
+├── sample_cities/
 │   └── ...
 └── outputs/
     └── YOURCITY_scores.geojson
